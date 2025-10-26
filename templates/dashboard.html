@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>API Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="navbar">
+    <span>Welcome, {{ username }} 🦫</span>
+    <a href="{{ url_for('logout') }}">Logout</a>
+  </div>
+
+  <h2>🚀 Running API Folders</h2>
+  <ul class="api-list">
+    {% for folder, port in running_apps.items() %}
+      <li><a href="/{{ folder }}/" target="_blank">{{ folder }}</a> (port {{ port }})</li>
+    {% else %}
+      <li>No running APIs found.</li>
+    {% endfor %}
+  </ul>
+</body>
+</html>
