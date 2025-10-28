@@ -1,0 +1,773 @@
+from flask import Flask, request, jsonify
+import asyncio
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
+from google.protobuf.json_format import MessageToJson
+import binascii
+import aiohttp
+import requests
+import json
+import like_pb2
+import like_count_pb2
+import uid_generator_pb2
+from google.protobuf.message import DecodeError
+from datetime import datetime, timedelta
+from pymongo import MongoClient
+from bson.objectid import ObjectId
+import secrets
+import string
+from apscheduler.schedulers.background import BackgroundScheduler
+import atexit
+import os
+import math
+
+app = Flask(__name__)
+
+# ✅ Corrected MongoDB connection
+client = MongoClient("mongodb+srv://ravsahebsalve50_db_user:ravsahebsalve50_db_user@cluster0.6xtenga.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
+
+# ✅ Replace 'yourdb' with actual database name (choose your own)
+db = client["Cluster0"]  # You can name it whatever you like
+keys_collection = db.api_keys
+
+# Owner key for administrative functions
+OWNER_KEY = "Nilay-Rishika"
+
+# Initialize scheduler for daily reset
+scheduler = BackgroundScheduler(daemon=True)
+scheduler.start()
+atexit.register(lambda: scheduler.shutdown())
+
+def reset_remaining_requests():
+    """Reset remaining requests for all active keys to their total_requests"""
+    try:
+        now = datetime.now()
+        active_keys = keys_collection.find({
+            "is_active": True,
+            "expires_at": {"$gt": now}
+        })
+        
+        for key in active_keys:
+            keys_collection.update_one(
+                {"_id": key["_id"]},
+                {
+                    "$set": {
+                        "remaining_requests": key["total_requests"],
+                        "last_reset": now,
+                        "batch_count": 0,  # Reset batch count daily
+                        "current_batch_used": 0  # Reset current batch usage
+                    }
+                }
+            )
+        app.logger.info(f"Successfully reset requests at {now}")
+    except Exception as e:
+        app.logger.error(f"Error in reset_remaining_requests: {e}")
+
+# Schedule daily reset at midnight
+scheduler.add_job(
+    reset_remaining_requests,
+    'cron',
+    hour=0,
+    minute=0,
+    second=0,
+    timezone='UTC'
+)
+
+def load_tokens(server_name):
+    try:
+        if server_name == "IND":
+            with open("token_ind.json", "r") as f:
+                tokens = json.load(f)
+        elif server_name in {"BR", "US", "SAC", "NA"}:
+            with open("token_br.json", "r") as f:
+                tokens = json.load(f)
+        else:
+            with open("token_bd.json", "r") as f:
+                tokens = json.load(f)
+        return tokens
+    except Exception as e:
+        app.logger.error(f"Error loading tokens for server {server_name}: {e}")
+        return None
+
+def encrypt_message(plaintext):
+    try:
+        key = b'Yg&tc%DEuh6%Zc^8'
+        iv = b'6oyZDr22E3ychjM%'
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        padded_message = pad(plaintext, AES.block_size)
+        encrypted_message = cipher.encrypt(padded_message)
+        return binascii.hexlify(encrypted_message).decode('utf-8')
+    except Exception as e:
+        app.logger.error(f"Error encrypting message: {e}")
+        return None
+
+def create_protobuf_message(user_id, region):
+    try:
+        message = like_pb2.like()
+        message.uid = int(user_id)
+        message.region = region
+        return message.SerializeToString()
+    except Exception as e:
+        app.logger.error(f"Error creating protobuf message: {e}")
+        return None
+
+async def send_request(encrypted_uid, token, url):
+    try:
+        edata = bytes.fromhex(encrypted_uid)
+        headers = {
+            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+            'Connection': "Keep-Alive",
+            'Accept-Encoding': "gzip",
+            'Authorization': f"Bearer {token}",
+            'Content-Type': "application/x-www-form-urlencoded",
+            'Expect': "100-continue",
+            'X-Unity-Version': "2018.4.11f1",
+            'X-GA': "v1 1",
+            'ReleaseVersion': "OB50"
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=edata, headers=headers) as response:
+                if response.status != 200:
+                    app.logger.error(f"Request failed with status code: {response.status}")
+                    return response.status
+                return await response.text()
+    except Exception as e:
+        app.logger.error(f"Exception in send_request: {e}")
+        return None
+
+async def send_multiple_requests(uid, server_name, url):
+    try:
+        region = server_name
+        protobuf_message = create_protobuf_message(uid, region)
+        if protobuf_message is None:
+            app.logger.error("Failed to create protobuf message.")
+            return None
+        encrypted_uid = encrypt_message(protobuf_message)
+        if encrypted_uid is None:
+            app.logger.error("Encryption failed.")
+            return None
+        tasks = []
+        tokens = load_tokens(server_name)
+        if tokens is None:
+            app.logger.error("Failed to load tokens.")
+            return None
+        for i in range(100):
+            token = tokens[i % len(tokens)]["token"]
+            tasks.append(send_request(encrypted_uid, token, url))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return results
+    except Exception as e:
+        app.logger.error(f"Exception in send_multiple_requests: {e}")
+        return None
+
+def create_protobuf(uid):
+    try:
+        message = uid_generator_pb2.uid_generator()
+        message.saturn_ = int(uid)
+        message.garena = 1
+        return message.SerializeToString()
+    except Exception as e:
+        app.logger.error(f"Error creating uid protobuf: {e}")
+        return None
+
+def enc(uid):
+    protobuf_data = create_protobuf(uid)
+    if protobuf_data is None:
+        return None
+    encrypted_uid = encrypt_message(protobuf_data)
+    return encrypted_uid
+
+def make_request(encrypt, server_name, token):
+    try:
+        if server_name == "IND":
+            url = "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
+        elif server_name in {"BR", "US", "SAC", "NA"}:
+            url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
+        else:
+            url = "https://clientbp.ggblueshark.com/GetPlayerPersonalShow"
+        edata = bytes.fromhex(encrypt)
+        headers = {
+            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+            'Connection': "Keep-Alive",
+            'Accept-Encoding': "gzip",
+            'Authorization': f"Bearer {token}",
+            'Content-Type': "application/x-www-form-urlencoded",
+            'Expect': "100-continue",
+            'X-Unity-Version': "2018.4.11f1",
+            'X-GA': "v1 1",
+            'ReleaseVersion': "OB50"
+        }
+        response = requests.post(url, data=edata, headers=headers, verify=False)
+        hex_data = response.content.hex()
+        binary = bytes.fromhex(hex_data)
+        decode = decode_protobuf(binary)
+        if decode is None:
+            app.logger.error("Protobuf decoding returned None.")
+        return decode
+    except Exception as e:
+        app.logger.error(f"Error in make_request: {e}")
+        return None
+
+def decode_protobuf(binary):
+    try:
+        items = like_count_pb2.Info()
+        items.ParseFromString(binary)
+        return items
+    except DecodeError as e:
+        app.logger.error(f"Error decoding Protobuf data: {e}")
+        return None
+    except Exception as e:
+        app.logger.error(f"Unexpected error during protobuf decoding: {e}")
+        return None
+
+def authenticate_key(api_key):
+    """Check if API key exists and is valid"""
+    try:
+        key_data = keys_collection.find_one({"key": api_key})
+        if not key_data:
+            return None
+        
+        # Check expiration
+        now = datetime.now()
+        if 'expires_at' in key_data and now > key_data['expires_at']:
+            # Mark as inactive if expired
+            keys_collection.update_one(
+                {"key": api_key},
+                {"$set": {"is_active": False}}
+            )
+            return None
+        
+        # Check if key is active
+        if 'is_active' in key_data and not key_data['is_active']:
+            return None
+        
+        # Check if we need to reset remaining requests (new day)
+        if 'last_reset' in key_data:
+            last_reset = key_data['last_reset']
+            if isinstance(last_reset, str):
+                last_reset = datetime.fromisoformat(last_reset)
+            if last_reset.date() < now.date():
+                keys_collection.update_one(
+                    {"key": api_key},
+                    {"$set": {
+                        "remaining_requests": key_data['total_requests'],
+                        "last_reset": now,
+                        "batch_count": 0,  # Reset batch count on new day
+                        "current_batch_used": 0  # Reset current batch usage
+                    }}
+                )
+                key_data['remaining_requests'] = key_data['total_requests']
+                key_data['batch_count'] = 0
+                key_data['current_batch_used'] = 0
+        
+        return key_data
+    except Exception as e:
+        app.logger.error(f"Error in authenticate_key: {e}")
+        return None
+
+def update_key_usage(api_key, decrement=1):
+    """Decrement remaining requests count for a key only when likes are given"""
+    try:
+        key_data = keys_collection.find_one({"key": api_key})
+        if not key_data:
+            return
+        
+        # Get current values
+        remaining_requests = key_data['remaining_requests'] - decrement
+        current_batch_used = key_data.get('current_batch_used', 0) + decrement
+        batch_count = key_data.get('batch_count', 0)
+        batch_size = key_data.get('batch_size', 30)
+        
+        # Check if we've completed a batch
+        if current_batch_used >= batch_size:
+            batch_count += 1
+            current_batch_used = current_batch_used % batch_size  # Carry over to next batch if needed
+        
+        # Calculate batch number
+        batch_number = math.floor(remaining_requests / batch_size)
+        
+        keys_collection.update_one(
+            {"key": api_key},
+            {
+                "$inc": {"remaining_requests": -decrement},
+                "$set": {
+                    "last_used": datetime.now(),
+                    "batch_number": batch_number,
+                    "batch_count": batch_count,
+                    "current_batch_used": current_batch_used
+                }
+            }
+        )
+    except Exception as e:
+        app.logger.error(f"Error updating key usage: {e}")
+
+def authenticate_owner_key():
+    """Check if the request includes the valid owner key"""
+    owner_key = request.headers.get('X-OWNER-KEY') or request.args.get('owner_key')
+    return owner_key == OWNER_KEY
+
+@app.route('/clear', methods=['GET'])
+def clear_database():
+    """Clear/delete all data from the database using owner_key parameter"""
+    owner_key = request.args.get('owner_key')
+    
+    if not owner_key:
+        return jsonify({"error": "owner_key parameter is required"}), 401
+    
+    if owner_key != OWNER_KEY:
+        return jsonify({"error": "Invalid owner key"}), 403
+    
+    try:
+        # Delete all documents in the collection
+        result = keys_collection.delete_many({})
+        
+        return jsonify({
+            "status": "success",
+            "message": f"Database cleared successfully. Deleted {result.deleted_count} keys."
+        }), 200
+    except Exception as e:
+        app.logger.error(f"Error clearing database: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/status', methods=['GET'])
+def api_status():
+    """Get API usage statistics"""
+    # Require owner key authentication
+    if not authenticate_owner_key():
+        return jsonify({"error": "Owner key is required to check API status"}), 401
+    
+    try:
+        # Get total keys
+        total_keys = keys_collection.count_documents({})
+        
+        # Get active keys
+        active_keys = keys_collection.count_documents({
+            "is_active": True,
+            "expires_at": {"$gt": datetime.now()}
+        })
+        
+        # Get expired keys
+        expired_keys = keys_collection.count_documents({
+            "$or": [
+                {"is_active": False},
+                {"expires_at": {"$lt": datetime.now()}}
+            ]
+        })
+        
+        # Get total requests today
+        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        today_requests = keys_collection.aggregate([
+            {"$match": {"last_used": {"$gte": today_start}}},
+            {"$group": {"_id": None, "total_used": {"$sum": {"$subtract": ["$total_requests", "$remaining_requests"]}}}}
+        ])
+        
+        today_requests_result = list(today_requests)
+        today_requests_count = today_requests_result[0]["total_used"] if today_requests_result else 0
+        
+        # Get total available requests
+        total_available = keys_collection.aggregate([
+            {"$match": {"is_active": True, "expires_at": {"$gt": datetime.now()}}},
+            {"$group": {"_id": None, "total_available": {"$sum": "$remaining_requests"}}}
+        ])
+        
+        total_available_result = list(total_available)
+        total_available_count = total_available_result[0]["total_available"] if total_available_result else 0
+        
+        # Get total batches used today
+        today_batches = keys_collection.aggregate([
+            {"$match": {"last_used": {"$gte": today_start}}},
+            {"$group": {"_id": None, "total_batches": {"$sum": "$batch_count"}}}
+        ])
+        
+        today_batches_result = list(today_batches)
+        today_batches_count = today_batches_result[0]["total_batches"] if today_batches_result else 0
+        
+        return jsonify({
+            "status": "success",
+            "data": {
+                "total_keys": total_keys,
+                "active_keys": active_keys,
+                "expired_keys": expired_keys,
+                "today_requests": today_requests_count,
+                "today_batches": today_batches_count,
+                "available_requests": total_available_count,
+                "next_reset": (datetime.now() + timedelta(days=1)).replace(hour=0, minute=0, second=0).isoformat()
+            }
+        }), 200
+    except Exception as e:
+        app.logger.error(f"Error getting API status: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/reset', methods=['POST'])
+def reset_database():
+    """Reset the entire database (delete all keys)"""
+    # Require owner key authentication
+    if not authenticate_owner_key():
+        return jsonify({"error": "Owner key is required to reset database"}), 401
+    
+    try:
+        # Delete all documents in the collection
+        result = keys_collection.delete_many({})
+        
+        return jsonify({
+            "status": "success",
+            "message": f"Database reset successfully. Deleted {result.deleted_count} keys."
+        }), 200
+    except Exception as e:
+        app.logger.error(f"Error resetting database: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/key/create', methods=['POST'])
+def create_key():
+    # Require owner key authentication for creating new keys
+    if not authenticate_owner_key():
+        return jsonify({"error": "Owner key is required to create API keys"}), 401
+    
+    try:
+        data = request.get_json()
+        custom_key = data.get('custom_key')
+        total_requests = int(data.get('total_requests', 1000))
+        expiry_days = int(data.get('expiry_days', 30))
+        batch_size = int(data.get('batch_size', 30))
+        notes = data.get('notes', '')
+        
+        if custom_key:
+            if keys_collection.find_one({"key": custom_key}):
+                return jsonify({"error": "Custom key already exists"}), 400
+            api_key = custom_key
+        else:
+            alphabet = string.ascii_letters + string.digits
+            api_key = ''.join(secrets.choice(alphabet) for _ in range(32))
+        
+        expires_at = datetime.now() + timedelta(days=expiry_days)
+        
+        # Calculate initial batch number
+        batch_number = math.floor(total_requests / batch_size)
+        
+        key_doc = {
+            "key": api_key,
+            "created_at": datetime.now(),
+            "expires_at": expires_at,
+            "total_requests": total_requests,
+            "remaining_requests": total_requests,
+            "batch_size": batch_size,
+            "batch_number": batch_number,
+            "batch_count": 0,
+            "current_batch_used": 0,
+            "notes": notes,
+            "is_active": True,
+            "last_reset": datetime.now()
+        }
+        
+        keys_collection.insert_one(key_doc)
+        
+        return jsonify({
+            "message": "API key created successfully",
+            "key": api_key,
+            "expires_at": expires_at.isoformat(),
+            "total_requests": total_requests,
+            "batch_size": batch_size,
+            "batch_number": batch_number,
+            "batch_count": 0,
+            "notes": notes
+        }), 201
+    except Exception as e:
+        app.logger.error(f"Error creating API key: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/key/list', methods=['GET'])
+def list_keys():
+    """List all API keys (requires owner key)"""
+    if not authenticate_owner_key():
+        return jsonify({"error": "Owner key is required to list API keys"}), 401
+    
+    try:
+        keys = list(keys_collection.find({}, {"_id": 0}))
+        
+        # Convert datetime objects to strings
+        for key in keys:
+            if 'created_at' in key and isinstance(key['created_at'], datetime):
+                key['created_at'] = key['created_at'].isoformat()
+            if 'expires_at' in key and isinstance(key['expires_at'], datetime):
+                key['expires_at'] = key['expires_at'].isoformat()
+            if 'last_reset' in key and isinstance(key['last_reset'], datetime):
+                key['last_reset'] = key['last_reset'].isoformat()
+            if 'last_used' in key and isinstance(key['last_used'], datetime):
+                key['last_used'] = key['last_used'].isoformat()
+        
+        return jsonify({"keys": keys}), 200
+    except Exception as e:
+        app.logger.error(f"Error listing API keys: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/key/check', methods=['GET'])
+def check_key():
+    """Check the status and details of an API key"""
+    try:
+        api_key = request.headers.get('X-API-KEY') or request.args.get('key')
+        if not api_key:
+            return jsonify({"error": "API key is required"}), 401
+        
+        key_data = authenticate_key(api_key)
+        if not key_data:
+            return jsonify({"error": "Invalid or expired API key"}), 403
+        
+        # Calculate current batch number if not present
+        if 'batch_number' not in key_data:
+            batch_size = key_data.get('batch_size', 30)
+            batch_number = math.floor(key_data['remaining_requests'] / batch_size)
+            keys_collection.update_one(
+                {"key": api_key},
+                {"$set": {"batch_number": batch_number}}
+            )
+            key_data['batch_number'] = batch_number
+        
+        # Remove MongoDB-specific fields before returning
+        key_data.pop('_id', None)
+        
+        # Convert datetime objects to strings
+        if 'created_at' in key_data and isinstance(key_data['created_at'], datetime):
+            key_data['created_at'] = key_data['created_at'].isoformat()
+        if 'expires_at' in key_data and isinstance(key_data['expires_at'], datetime):
+            key_data['expires_at'] = key_data['expires_at'].isoformat()
+        if 'last_reset' in key_data and isinstance(key_data['last_reset'], datetime):
+            key_data['last_reset'] = key_data['last_reset'].isoformat()
+        if 'last_used' in key_data and isinstance(key_data['last_used'], datetime):
+            key_data['last_used'] = key_data['last_used'].isoformat()
+        
+        return jsonify(key_data), 200
+    except Exception as e:
+        app.logger.error(f"Error checking API key: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/key/remove', methods=['DELETE'])
+def remove_key():
+    """Remove an API key (mark as inactive) - requires owner key"""
+    if not authenticate_owner_key():
+        return jsonify({"error": "Owner key is required to remove API keys"}), 401
+    
+    try:
+        api_key = request.headers.get('X-API-KEY') or request.args.get('key')
+        if not api_key:
+            return jsonify({"error": "API key is required"}), 401
+        
+        # First authenticate the key
+        key_data = authenticate_key(api_key)
+        if not key_data:
+            return jsonify({"error": "Invalid or expired API key"}), 403
+        
+        # Mark the key as inactive instead of deleting it
+        result = keys_collection.update_one(
+            {"key": api_key},
+            {"$set": {"is_active": False}}
+        )
+        
+        if result.modified_count == 1:
+            return jsonify({"message": "API key deactivated successfully"}), 200
+        else:
+            return jsonify({"error": "Failed to deactivate API key"}), 400
+    except Exception as e:
+        app.logger.error(f"Error removing API key: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/key/update', methods=['PUT'])
+def update_key():
+    """Update an API key's properties - requires owner key"""
+    if not authenticate_owner_key():
+        return jsonify({"error": "Owner key is required to update API keys"}), 401
+    
+    try:
+        api_key = request.headers.get('X-API-KEY') or request.args.get('key')
+        if not api_key:
+            return jsonify({"error": "API key is required"}), 401
+        
+        # First authenticate the key
+        key_data = authenticate_key(api_key)
+        if not key_data:
+            return jsonify({"error": "Invalid or expired API key"}), 403
+        
+        data = request.get_json()
+        update_fields = {}
+        
+        if 'total_requests' in data:
+            try:
+                total_requests = int(data['total_requests'])
+                update_fields['total_requests'] = total_requests
+                # Also update remaining_requests if increasing total_requests
+                if total_requests > key_data.get('total_requests', 0):
+                    update_fields['remaining_requests'] = total_requests - (key_data.get('total_requests', 0) - key_data.get('remaining_requests', 0))
+                
+                # Update batch number based on new total
+                batch_size = key_data.get('batch_size', 30)
+                update_fields['batch_number'] = math.floor(update_fields.get('remaining_requests', key_data.get('remaining_requests', 0)) / batch_size)
+            except ValueError:
+                return jsonify({"error": "total_requests must be an integer"}), 400
+        
+        if 'batch_size' in data:
+            try:
+                batch_size = int(data['batch_size'])
+                update_fields['batch_size'] = batch_size
+                # Update batch number based on new batch size
+                remaining_requests = key_data.get('remaining_requests', 0)
+                update_fields['batch_number'] = math.floor(remaining_requests / batch_size)
+            except ValueError:
+                return jsonify({"error": "batch_size must be an integer"}), 400
+        
+        if 'expiry_days' in data:
+            try:
+                expiry_days = int(data['expiry_days'])
+                new_expiry = datetime.now() + timedelta(days=expiry_days)
+                update_fields['expires_at'] = new_expiry
+            except ValueError:
+                return jsonify({"error": "expiry_days must be an integer"}), 400
+        
+        if 'is_active' in data:
+            update_fields['is_active'] = bool(data['is_active'])
+        
+        if 'notes' in data:
+            update_fields['notes'] = str(data['notes'])
+        
+        if not update_fields:
+            return jsonify({"error": "No valid fields to update"}), 400
+        
+        result = keys_collection.update_one(
+            {"key": api_key},
+            {"$set": update_fields}
+        )
+        
+        if result.modified_count == 1:
+            return jsonify({"message": "API key updated successfully"}), 200
+        else:
+            return jsonify({"error": "No changes made to API key"}), 400
+    except Exception as e:
+        app.logger.error(f"Error updating API key: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/like', methods=['GET'])
+def handle_requests():
+    api_key = request.headers.get('X-API-KEY') or request.args.get('key')
+    if not api_key:
+        return jsonify({"error": "API key is required"}), 401
+    
+    key_data = authenticate_key(api_key)
+    if not key_data:
+        return jsonify({"error": "Invalid or expired API key"}), 403
+    
+    # Check remaining requests
+    if key_data.get('remaining_requests', 0) <= 0:
+        return jsonify({
+            "error": "No remaining requests",
+            "status": 0,
+            "next_reset": (datetime.now() + timedelta(days=1)).replace(hour=0, minute=0, second=0).isoformat()
+        }), 429
+    
+    uid = request.args.get("uid")
+    server_name = request.args.get("server_name", "").upper()
+    if not uid or not server_name:
+        return jsonify({"error": "UID and server_name are required"}), 400
+
+    try:
+        def process_request():
+            tokens = load_tokens(server_name)
+            if tokens is None:
+                raise Exception("Failed to load tokens.")
+            token = tokens[0]['token']
+            encrypted_uid = enc(uid)
+            if encrypted_uid is None:
+                raise Exception("Encryption of UID failed.")
+
+            # First request to get initial data
+            before = make_request(encrypted_uid, server_name, token)
+            if before is None:
+                raise Exception("Failed to retrieve initial player info.")
+            
+            try:
+                jsone = MessageToJson(before)
+                data_before = json.loads(jsone)
+                account_info = data_before.get('AccountInfo', {})
+                before_like = int(account_info.get('Likes', 0))
+                player_level = int(account_info.get('Level', 0))
+            except Exception as e:
+                raise Exception(f"Error processing before data: {str(e)}")
+
+            # Determine the correct URL for likes
+            if server_name == "IND":
+                url = "https://client.ind.freefiremobile.com/LikeProfile"
+            elif server_name in {"BR", "US", "SAC", "NA"}:
+                url = "https://client.us.freefiremobile.com/LikeProfile"
+            else:
+                url = "https://clientbp.ggblueshark.com/LikeProfile"
+
+            # Send like requests
+            asyncio.run(send_multiple_requests(uid, server_name, url))
+
+            # Second request to get updated data
+            after = make_request(encrypted_uid, server_name, token)
+            if after is None:
+                raise Exception("Failed to retrieve player info after like requests.")
+            
+            try:
+                jsone_after = MessageToJson(after)
+                data_after = json.loads(jsone_after)
+                account_info_after = data_after.get('AccountInfo', {})
+                after_like = int(account_info_after.get('Likes', 0))
+                player_uid = int(account_info_after.get('UID', 0))
+                player_name = str(account_info_after.get('PlayerNickname', ''))
+                like_given = after_like - before_like
+                player_level = int(account_info_after.get('Level', 0))
+            except Exception as e:
+                raise Exception(f"Error processing after data: {str(e)}")
+            
+            # Determine status and update key usage
+            if like_given > 0:
+                status = 1
+                update_key_usage(api_key, 1)  # Always decrement by 1 when likes are given
+            else:
+                status = 2
+            
+            # Get updated key info
+            updated_key_data = authenticate_key(api_key)
+            if not updated_key_data:
+                raise Exception("Failed to retrieve updated key info")
+            
+            # Calculate batch information
+            batch_size = updated_key_data.get('batch_size', 30)
+            batch_number = updated_key_data.get('batch_number', 0)
+            batch_count = updated_key_data.get('batch_count', 0)
+            current_batch_used = updated_key_data.get('current_batch_used', 0)
+            
+            response = {
+                "response": {
+                    "KeyExpiresAt": updated_key_data['expires_at'].isoformat(),
+                    "KeyRemainingRequests": f"{updated_key_data['remaining_requests']}/{updated_key_data['total_requests']}",
+                    "BatchSize": batch_size,
+                    "BatchNumber": batch_number,
+                    "BatchCount": batch_count,
+                    "CurrentBatchUsed": current_batch_used,
+                    "LikesGivenByAPI": like_given,
+                    "LikesafterCommand": after_like,
+                    "LikesbeforeCommand": before_like,
+                    "PlayerNickname": player_name,
+                    "UID": player_uid
+                },
+                "status": status
+            }
+            
+            return response
+
+        result = process_request()
+        return jsonify(result)
+    except Exception as e:
+        app.logger.error(f"Error processing request: {e}")
+        return jsonify({"error": str(e), "status": 0}), 500
+
+import sys
+
+if __name__ == '__main__':
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
+    print(f"[🚀] Starting {__name__.upper()} on port {port} ...")
+    try:
+        asyncio.run(startup())
+    except Exception as e:
+        print(f"[⚠️] Startup warning: {e} — continuing without full initialization")
+    app.run(host='0.0.0.0', port=port, debug=False)
