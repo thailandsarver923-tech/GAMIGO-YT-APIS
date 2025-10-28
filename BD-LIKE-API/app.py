@@ -24,7 +24,7 @@ import math
 app = Flask(__name__)
 
 # ✅ Corrected MongoDB connection
-client = MongoClient("mongodb+srv://ravsahebsalve50_db_user:ravsahebsalve50_db_user@cluster0.6xtenga.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
+client = MongoClient("mongodb+srv://bemim25990_db_user:DIVUfSp7xC0U2HIB@cluster0.kfz7vdy.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
 
 # ✅ Replace 'yourdb' with actual database name (choose your own)
 db = client["Cluster0"]  # You can name it whatever you like
